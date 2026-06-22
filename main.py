@@ -5,8 +5,9 @@ from __future__ import annotations
 from enum import Enum, auto
 from pathlib import Path
 
-import pygame
+import random
 
+import pygame
 
 WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 400
@@ -18,6 +19,23 @@ GROUND_Y = 300
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSET_DIR = BASE_DIR / "assets"
+
+CLOUD_SPEED = 2
+CLOUD_MIN_Y = 12
+CLOUD_MAX_Y = 24
+CLOUD_SPAWN_INTERVAL = 170
+CLOUD_SPAWN_JITTER = 30
+CLOUD_MAX_COUNT = 3
+
+OBSTACLE_SPEED = 8
+# A full jump covers roughly 300 horizontal pixels at this speed, so these
+# placeholder widths stay comfortably clearable while still varying visually.
+OBSTACLE_MIN_WIDTH = 20
+OBSTACLE_MAX_WIDTH = 70
+OBSTACLE_MIN_HEIGHT = 35
+OBSTACLE_MAX_HEIGHT = 85
+OBSTACLE_MIN_SPAWN_FRAMES = 75
+OBSTACLE_MAX_SPAWN_FRAMES = 125
 
 
 class DinosaurState(Enum):
@@ -61,14 +79,18 @@ class Dinosaur:
         ]
         jump_sprite = self._load_image(asset_dir / "DinoJump.png")
         start_sprite = self._load_image(asset_dir / "DinoStart.png")
+        duck_sprites = self._choose_duck_sprites(
+            [
+                self._load_image(asset_dir / "DinoDuck1.png"),
+                self._load_image(asset_dir / "DinoDuck2.png"),
+            ],
+            running_sprites,
+        )
 
         return {
             "running": running_sprites,
             "jumping": self._choose_jump_sprite(jump_sprite, start_sprite, running_sprites),
-            "ducking": [
-                self._load_image(asset_dir / "DinoDuck1.png"),
-                self._load_image(asset_dir / "DinoDuck2.png"),
-            ],
+            "ducking": duck_sprites,
             "dead": self._load_image(asset_dir / "DinoDead.png"),
             "start": start_sprite,
         }
@@ -101,6 +123,30 @@ class Dinosaur:
 
         return jump_sprite
 
+    @staticmethod
+    def _choose_duck_sprites(
+        duck_sprites: list[pygame.Surface],
+        running_sprites: list[pygame.Surface],
+    ) -> list[pygame.Surface]:
+        """Keep duck animation frames low so holding Down never pops upright."""
+        run_height = max(sprite.get_bounding_rect().height for sprite in running_sprites)
+        low_profile_frames = [
+            sprite
+            for sprite in duck_sprites
+            if sprite.get_bounding_rect().height < run_height * 0.8
+        ]
+
+        # This asset set has DinoDuck1.png mislabeled as an upright frame.
+        # If only one true duck frame exists, reuse it for both animation slots
+        # so the state remains visually stable while Down is held.
+        if len(low_profile_frames) == 1:
+            return [low_profile_frames[0], low_profile_frames[0]]
+
+        if len(low_profile_frames) >= 2:
+            return low_profile_frames[:2]
+
+        return duck_sprites
+
     def handle_event(self, event: pygame.event.Event) -> None:
         """Translate key presses and releases into player intent."""
         if event.type == pygame.KEYDOWN:
@@ -123,8 +169,11 @@ class Dinosaur:
         """Return whether the dinosaur's feet are aligned with the ground."""
         return self.rect.bottom >= self.ground_y and self.state != DinosaurState.JUMPING
 
-    def update(self) -> None:
+    def update(self, pressed_keys: pygame.key.ScancodeWrapper | None = None) -> None:
         """Advance physics, state selection, and animation by one frame."""
+        if pressed_keys is not None:
+            self.down_key_held = pressed_keys[pygame.K_DOWN]
+
         if self.state == DinosaurState.JUMPING:
             self._apply_jump_physics()
         else:
@@ -240,6 +289,51 @@ class Dinosaur:
         surface.blit(self.image, self.draw_rect)
 
 
+class Cloud:
+    """Slow-moving background cloud with paced spawning handled by Game."""
+
+    def __init__(self, image: pygame.Surface) -> None:
+        self.image = image
+        self.x = float(WINDOW_WIDTH + random.randint(20, 120))
+        self.y = random.randint(CLOUD_MIN_Y, CLOUD_MAX_Y)
+        self.rect = self.image.get_rect(topleft=(round(self.x), self.y))
+
+    def update(self) -> None:
+        """Move left slowly so clouds feel like background scenery."""
+        self.x -= CLOUD_SPEED
+        self.rect.x = round(self.x)
+
+    def is_off_screen(self) -> bool:
+        """Return whether the cloud has fully left the viewport."""
+        return self.rect.right < 0
+
+    def draw(self, surface: pygame.Surface) -> None:
+        """Draw the cloud behind gameplay objects."""
+        surface.blit(self.image, self.rect)
+
+
+class CactusPlaceholder:
+    """Ground obstacle placeholder drawn as a jumpable rectangle."""
+
+    def __init__(self) -> None:
+        width = random.randint(OBSTACLE_MIN_WIDTH, OBSTACLE_MAX_WIDTH)
+        height = random.randint(OBSTACLE_MIN_HEIGHT, OBSTACLE_MAX_HEIGHT)
+        spawn_x = WINDOW_WIDTH + random.randint(20, 80)
+        self.rect = pygame.Rect(spawn_x, GROUND_Y - height, width, height)
+
+    def update(self) -> None:
+        """Move the obstacle toward the dinosaur at game speed."""
+        self.rect.x -= OBSTACLE_SPEED
+
+    def is_off_screen(self) -> bool:
+        """Return whether the obstacle has fully left the viewport."""
+        return self.rect.right < 0
+
+    def draw(self, surface: pygame.Surface) -> None:
+        """Draw a dark-grey rectangle as a temporary cactus stand-in."""
+        pygame.draw.rect(surface, OBJECT_COLOR, self.rect)
+
+
 class Game:
     """Top-level controller for window setup, events, updates, and drawing."""
 
@@ -248,8 +342,13 @@ class Game:
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption("Chrome Dino Run")
         self.clock = pygame.time.Clock()
+        self.cloud_image = Dinosaur._load_image(ASSET_DIR / "Cloud.png")
         self.dinosaur = Dinosaur(GROUND_Y, ASSET_DIR)
         self.running = True
+        self.clouds: list[Cloud] = []
+        self.obstacles: list[CactusPlaceholder] = []
+        self.cloud_spawn_timer = 20
+        self.obstacle_spawn_timer = 60
 
     def run(self) -> None:
         """Execute the main loop at a locked 60 FPS."""
@@ -271,11 +370,53 @@ class Game:
 
     def update(self) -> None:
         """Update game objects in a deterministic order."""
-        self.dinosaur.update()
+        pressed_keys = pygame.key.get_pressed()
+        self.dinosaur.update(pressed_keys)
+        self._update_clouds()
+        self._update_obstacles()
+
+    def _update_clouds(self) -> None:
+        """Spawn clouds at a steady pace and remove old ones."""
+        self.cloud_spawn_timer -= 1
+        if self.cloud_spawn_timer <= 0 and len(self.clouds) < CLOUD_MAX_COUNT:
+            self.clouds.append(Cloud(self.cloud_image))
+            self._reset_cloud_spawn_timer()
+
+        for cloud in self.clouds:
+            cloud.update()
+
+        self.clouds = [cloud for cloud in self.clouds if not cloud.is_off_screen()]
+
+    def _reset_cloud_spawn_timer(self) -> None:
+        """Schedule the next cloud with light jitter instead of wild gaps."""
+        self.cloud_spawn_timer = CLOUD_SPAWN_INTERVAL + random.randint(
+            -CLOUD_SPAWN_JITTER,
+            CLOUD_SPAWN_JITTER,
+        )
+
+    def _update_obstacles(self) -> None:
+        """Spawn and move cactus placeholders across the ground."""
+        self.obstacle_spawn_timer -= 1
+        if self.obstacle_spawn_timer <= 0:
+            self.obstacles.append(CactusPlaceholder())
+            self.obstacle_spawn_timer = random.randint(
+                OBSTACLE_MIN_SPAWN_FRAMES,
+                OBSTACLE_MAX_SPAWN_FRAMES,
+            )
+
+        for obstacle in self.obstacles:
+            obstacle.update()
+
+        self.obstacles = [
+            obstacle for obstacle in self.obstacles if not obstacle.is_off_screen()
+        ]
 
     def draw(self) -> None:
         """Render a complete frame."""
         self.screen.fill(BACKGROUND_COLOR)
+        for cloud in self.clouds:
+            cloud.draw(self.screen)
+
         pygame.draw.line(
             self.screen,
             OBJECT_COLOR,
@@ -283,6 +424,9 @@ class Game:
             (WINDOW_WIDTH, GROUND_Y),
             width=2,
         )
+        for obstacle in self.obstacles:
+            obstacle.draw(self.screen)
+
         self.dinosaur.draw(self.screen)
         pygame.display.flip()
 
