@@ -28,14 +28,13 @@ CLOUD_SPAWN_JITTER = 30
 CLOUD_MAX_COUNT = 3
 
 OBSTACLE_SPEED = 8
-# A full jump covers roughly 300 horizontal pixels at this speed, so these
-# placeholder widths stay comfortably clearable while still varying visually.
-OBSTACLE_MIN_WIDTH = 20
-OBSTACLE_MAX_WIDTH = 70
-OBSTACLE_MIN_HEIGHT = 35
-OBSTACLE_MAX_HEIGHT = 85
 OBSTACLE_MIN_SPAWN_FRAMES = 75
 OBSTACLE_MAX_SPAWN_FRAMES = 125
+
+CACTUS_ASSET_FILES = {
+    "large": ["LargeCactus1.png", "LargeCactus2.png", "LargeCactus3.png"],
+    "small": ["SmallCactus1.png", "SmallCactus2.png", "SmallCactus3.png"],
+}
 
 
 class DinosaurState(Enum):
@@ -312,26 +311,50 @@ class Cloud:
         surface.blit(self.image, self.rect)
 
 
-class CactusPlaceholder:
-    """Ground obstacle placeholder drawn as a jumpable rectangle."""
+class Cactus:
+    """Asset-driven cactus obstacle with a tight visible-pixel hitbox."""
 
-    def __init__(self) -> None:
-        width = random.randint(OBSTACLE_MIN_WIDTH, OBSTACLE_MAX_WIDTH)
-        height = random.randint(OBSTACLE_MIN_HEIGHT, OBSTACLE_MAX_HEIGHT)
-        spawn_x = WINDOW_WIDTH + random.randint(20, 80)
-        self.rect = pygame.Rect(spawn_x, GROUND_Y - height, width, height)
+    def __init__(self, image: pygame.Surface) -> None:
+        self.image = image
+        self.bounds = self._visible_sprite_bounds()
+        self.x = float(WINDOW_WIDTH + random.randint(20, 80))
+
+        # The collision rectangle tracks only non-transparent pixels, while the
+        # draw rectangle preserves the original PNG canvas and its alpha padding.
+        self.rect = pygame.Rect(
+            round(self.x),
+            GROUND_Y - self.bounds.height,
+            self.bounds.width,
+            self.bounds.height,
+        )
+        self.draw_rect = self.image.get_rect()
+        self._sync_draw_rect_to_hitbox()
+
+    def _visible_sprite_bounds(self) -> pygame.Rect:
+        """Return non-transparent sprite bounds for collision and grounding."""
+        bounds = self.image.get_bounding_rect()
+        if bounds.width == 0 or bounds.height == 0:
+            return self.image.get_rect()
+        return bounds
 
     def update(self) -> None:
-        """Move the obstacle toward the dinosaur at game speed."""
-        self.rect.x -= OBSTACLE_SPEED
+        """Move the cactus smoothly toward the dinosaur at obstacle speed."""
+        self.x -= OBSTACLE_SPEED
+        self.rect.x = round(self.x)
+        self._sync_draw_rect_to_hitbox()
+
+    def _sync_draw_rect_to_hitbox(self) -> None:
+        """Align the original texture canvas around the tight hitbox."""
+        self.draw_rect.left = self.rect.left - self.bounds.left
+        self.draw_rect.top = self.rect.top - self.bounds.top
 
     def is_off_screen(self) -> bool:
-        """Return whether the obstacle has fully left the viewport."""
+        """Return whether the visible cactus pixels have left the viewport."""
         return self.rect.right < 0
 
     def draw(self, surface: pygame.Surface) -> None:
-        """Draw a dark-grey rectangle as a temporary cactus stand-in."""
-        pygame.draw.rect(surface, OBJECT_COLOR, self.rect)
+        """Blit the exact cactus PNG at its current world position."""
+        surface.blit(self.image, self.draw_rect)
 
 
 class Game:
@@ -342,13 +365,34 @@ class Game:
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption("Chrome Dino Run")
         self.clock = pygame.time.Clock()
-        self.cloud_image = Dinosaur._load_image(ASSET_DIR / "Cloud.png")
+        self.cloud_image = self._load_image(ASSET_DIR / "Cloud.png")
+        self.cactus_images = self._load_cactus_images(ASSET_DIR)
         self.dinosaur = Dinosaur(GROUND_Y, ASSET_DIR)
         self.running = True
         self.clouds: list[Cloud] = []
-        self.obstacles: list[CactusPlaceholder] = []
+        self.obstacles: list[Cactus] = []
         self.cloud_spawn_timer = 20
         self.obstacle_spawn_timer = 60
+
+    @staticmethod
+    def _load_image(path: Path) -> pygame.Surface:
+        """Load an image once, preserving PNG transparency."""
+        try:
+            return pygame.image.load(str(path)).convert_alpha()
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Missing required sprite asset: {path}") from exc
+        except pygame.error as exc:
+            raise RuntimeError(f"Unable to load sprite asset: {path}") from exc
+
+    def _load_cactus_images(self, asset_dir: Path) -> dict[str, list[pygame.Surface]]:
+        """Pre-load cactus variants so gameplay never rereads image files."""
+        return {
+            group_name: [
+                self._load_image(asset_dir / file_name)
+                for file_name in file_names
+            ]
+            for group_name, file_names in CACTUS_ASSET_FILES.items()
+        }
 
     def run(self) -> None:
         """Execute the main loop at a locked 60 FPS."""
@@ -395,10 +439,10 @@ class Game:
         )
 
     def _update_obstacles(self) -> None:
-        """Spawn and move cactus placeholders across the ground."""
+        """Spawn and move cactus obstacles across the ground."""
         self.obstacle_spawn_timer -= 1
         if self.obstacle_spawn_timer <= 0:
-            self.obstacles.append(CactusPlaceholder())
+            self.obstacles.append(Cactus(self._select_cactus_image()))
             self.obstacle_spawn_timer = random.randint(
                 OBSTACLE_MIN_SPAWN_FRAMES,
                 OBSTACLE_MAX_SPAWN_FRAMES,
@@ -410,6 +454,11 @@ class Game:
         self.obstacles = [
             obstacle for obstacle in self.obstacles if not obstacle.is_off_screen()
         ]
+
+    def _select_cactus_image(self) -> pygame.Surface:
+        """Choose a large or small cactus group, then one of its three variants."""
+        group_name = random.choice(("large", "small"))
+        return random.choice(self.cactus_images[group_name])
 
     def draw(self) -> None:
         """Render a complete frame."""
