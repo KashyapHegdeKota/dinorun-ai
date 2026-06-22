@@ -27,9 +27,14 @@ CLOUD_SPAWN_INTERVAL = 170
 CLOUD_SPAWN_JITTER = 30
 CLOUD_MAX_COUNT = 3
 
-OBSTACLE_SPEED = 8
-OBSTACLE_MIN_SPAWN_FRAMES = 75
-OBSTACLE_MAX_SPAWN_FRAMES = 125
+INITIAL_GAME_SPEED = 8.0
+SPEED_ACCELERATION_PER_FRAME = 0.002
+SCORE_INCREMENT_SCALE = 0.025
+OBSTACLE_MIN_GAP_PIXELS = 420
+OBSTACLE_MAX_GAP_PIXELS = 720
+OBSTACLE_MIN_SAFE_FRAMES = 50
+OBSTACLE_MAX_SAFE_FRAMES = 85
+FIRST_OBSTACLE_DELAY_FRAMES = 60
 
 CACTUS_ASSET_FILES = {
     "large": ["LargeCactus1.png", "LargeCactus2.png", "LargeCactus3.png"],
@@ -43,6 +48,7 @@ class DinosaurState(Enum):
     RUNNING = auto()
     JUMPING = auto()
     DUCKING = auto()
+    DEAD = auto()
 
 
 class Dinosaur:
@@ -148,6 +154,9 @@ class Dinosaur:
 
     def handle_event(self, event: pygame.event.Event) -> None:
         """Translate key presses and releases into player intent."""
+        if self.state == DinosaurState.DEAD:
+            return
+
         if event.type == pygame.KEYDOWN:
             if event.key in (pygame.K_SPACE, pygame.K_UP):
                 self.jump()
@@ -158,6 +167,9 @@ class Dinosaur:
 
     def jump(self) -> None:
         """Launch upward only when the dinosaur is touching the ground."""
+        if self.state == DinosaurState.DEAD:
+            return
+
         if not self.is_grounded():
             return
 
@@ -170,6 +182,10 @@ class Dinosaur:
 
     def update(self, pressed_keys: pygame.key.ScancodeWrapper | None = None) -> None:
         """Advance physics, state selection, and animation by one frame."""
+        if self.state == DinosaurState.DEAD:
+            self._sync_image_and_hitbox()
+            return
+
         if pressed_keys is not None:
             self.down_key_held = pressed_keys[pygame.K_DOWN]
 
@@ -182,6 +198,25 @@ class Dinosaur:
             self._set_state(ground_state)
 
         self._advance_animation()
+
+    def die(self) -> None:
+        """Switch to the dead sprite and stop all player motion."""
+        self.velocity_y = 0.0
+        self.down_key_held = False
+        self._set_state(DinosaurState.DEAD)
+
+    def reset(self) -> None:
+        """Restore the dinosaur to its initial grounded running state."""
+        self.state = DinosaurState.RUNNING
+        self.animation_frame = 0
+        self.animation_counter = 0
+        self.velocity_y = 0.0
+        self.down_key_held = False
+        running_sprites = self.sprites["running"]
+        assert isinstance(running_sprites, list)
+        self.image = running_sprites[self.animation_frame]
+        self._place_sprite(self.START_X, self.ground_y)
+        self.position_y = float(self.rect.y)
 
     def _apply_jump_physics(self) -> None:
         """Move vertically using velocity, then accelerate downward."""
@@ -215,7 +250,7 @@ class Dinosaur:
 
     def _advance_animation(self) -> None:
         """Toggle running and ducking sprites every fixed number of frames."""
-        if self.state == DinosaurState.JUMPING:
+        if self.state in (DinosaurState.JUMPING, DinosaurState.DEAD):
             self._sync_image_and_hitbox()
             return
 
@@ -235,7 +270,9 @@ class Dinosaur:
             return
 
         left = self.rect.left
-        bottom = self.ground_y if self.state != DinosaurState.JUMPING else self.rect.bottom
+        bottom = self.ground_y
+        if self.state in (DinosaurState.JUMPING, DinosaurState.DEAD):
+            bottom = self.rect.bottom
 
         self.image = next_image
         self._place_sprite(left, bottom)
@@ -278,6 +315,11 @@ class Dinosaur:
             ducking_sprites = self.sprites["ducking"]
             assert isinstance(ducking_sprites, list)
             return ducking_sprites[self.animation_frame]
+
+        if self.state == DinosaurState.DEAD:
+            dead_sprite = self.sprites["dead"]
+            assert isinstance(dead_sprite, pygame.Surface)
+            return dead_sprite
 
         jumping_sprite = self.sprites["jumping"]
         assert isinstance(jumping_sprite, pygame.Surface)
@@ -337,9 +379,9 @@ class Cactus:
             return self.image.get_rect()
         return bounds
 
-    def update(self) -> None:
+    def update(self, game_speed: float) -> None:
         """Move the cactus smoothly toward the dinosaur at obstacle speed."""
-        self.x -= OBSTACLE_SPEED
+        self.x -= game_speed
         self.rect.x = round(self.x)
         self._sync_draw_rect_to_hitbox()
 
@@ -365,14 +407,20 @@ class Game:
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption("Chrome Dino Run")
         self.clock = pygame.time.Clock()
+        self.score_font = pygame.font.SysFont("consolas", 24, bold=True)
+        self.game_over_font = pygame.font.SysFont("consolas", 36, bold=True)
         self.cloud_image = self._load_image(ASSET_DIR / "Cloud.png")
         self.cactus_images = self._load_cactus_images(ASSET_DIR)
         self.dinosaur = Dinosaur(GROUND_Y, ASSET_DIR)
         self.running = True
+        self.game_over = False
+        self.game_speed = INITIAL_GAME_SPEED
+        self.score = 0.0
+        self.high_score = 0
         self.clouds: list[Cloud] = []
         self.obstacles: list[Cactus] = []
         self.cloud_spawn_timer = 20
-        self.obstacle_spawn_timer = 60
+        self.obstacle_spawn_timer = FIRST_OBSTACLE_DELAY_FRAMES
 
     @staticmethod
     def _load_image(path: Path) -> pygame.Surface:
@@ -409,15 +457,32 @@ class Game:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+            elif self.game_over:
+                if event.type == pygame.KEYDOWN and event.key in (
+                    pygame.K_SPACE,
+                    pygame.K_UP,
+                ):
+                    self.reset_game()
             else:
                 self.dinosaur.handle_event(event)
 
     def update(self) -> None:
         """Update game objects in a deterministic order."""
+        if self.game_over:
+            return
+
         pressed_keys = pygame.key.get_pressed()
         self.dinosaur.update(pressed_keys)
+        self._update_score_and_speed()
         self._update_clouds()
         self._update_obstacles()
+        self._check_collisions()
+
+    def _update_score_and_speed(self) -> None:
+        """Increase score and gradually accelerate the game each active frame."""
+        self.score += self.game_speed * SCORE_INCREMENT_SCALE
+        self.high_score = max(self.high_score, int(self.score))
+        self.game_speed += SPEED_ACCELERATION_PER_FRAME
 
     def _update_clouds(self) -> None:
         """Spawn clouds at a steady pace and remove old ones."""
@@ -443,22 +508,56 @@ class Game:
         self.obstacle_spawn_timer -= 1
         if self.obstacle_spawn_timer <= 0:
             self.obstacles.append(Cactus(self._select_cactus_image()))
-            self.obstacle_spawn_timer = random.randint(
-                OBSTACLE_MIN_SPAWN_FRAMES,
-                OBSTACLE_MAX_SPAWN_FRAMES,
-            )
+            self.obstacle_spawn_timer = self._next_obstacle_spawn_frames()
 
         for obstacle in self.obstacles:
-            obstacle.update()
+            obstacle.update(self.game_speed)
 
         self.obstacles = [
             obstacle for obstacle in self.obstacles if not obstacle.is_off_screen()
         ]
 
+    def _next_obstacle_spawn_frames(self) -> int:
+        """Convert a safe pixel gap into frames at the current game speed."""
+        min_gap_pixels = max(
+            OBSTACLE_MIN_GAP_PIXELS,
+            self.game_speed * OBSTACLE_MIN_SAFE_FRAMES,
+        )
+        max_gap_pixels = max(
+            OBSTACLE_MAX_GAP_PIXELS,
+            self.game_speed * OBSTACLE_MAX_SAFE_FRAMES,
+        )
+        gap_pixels = random.uniform(min_gap_pixels, max_gap_pixels)
+        return max(1, round(gap_pixels / self.game_speed))
+
     def _select_cactus_image(self) -> pygame.Surface:
         """Choose a large or small cactus group, then one of its three variants."""
         group_name = random.choice(("large", "small"))
         return random.choice(self.cactus_images[group_name])
+
+    def _check_collisions(self) -> None:
+        """End the current run when the dinosaur hitbox touches a cactus."""
+        for obstacle in self.obstacles:
+            if self.dinosaur.rect.colliderect(obstacle.rect):
+                self._trigger_game_over()
+                return
+
+    def _trigger_game_over(self) -> None:
+        """Freeze gameplay and put the dinosaur into its dead sprite state."""
+        self.game_over = True
+        self.high_score = max(self.high_score, int(self.score))
+        self.dinosaur.die()
+
+    def reset_game(self) -> None:
+        """Start a fresh run while preserving the session high score."""
+        self.game_over = False
+        self.game_speed = INITIAL_GAME_SPEED
+        self.score = 0.0
+        self.clouds.clear()
+        self.obstacles.clear()
+        self.cloud_spawn_timer = 20
+        self.obstacle_spawn_timer = FIRST_OBSTACLE_DELAY_FRAMES
+        self.dinosaur.reset()
 
     def draw(self) -> None:
         """Render a complete frame."""
@@ -477,7 +576,34 @@ class Game:
             obstacle.draw(self.screen)
 
         self.dinosaur.draw(self.screen)
+        self._draw_score()
+        if self.game_over:
+            self._draw_game_over()
+
         pygame.display.flip()
+
+    def _draw_score(self) -> None:
+        """Render high score and current score in the top-right corner."""
+        score_text = f"HI {self.high_score:05d}  {int(self.score):05d}"
+        score_surface = self.score_font.render(score_text, True, OBJECT_COLOR)
+        score_rect = score_surface.get_rect(topright=(WINDOW_WIDTH - 20, 20))
+        self.screen.blit(score_surface, score_rect)
+
+    def _draw_game_over(self) -> None:
+        """Render the centered game-over prompt after a collision."""
+        message = self.game_over_font.render("GAME OVER", True, OBJECT_COLOR)
+        message_rect = message.get_rect(
+            center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 20)
+        )
+        self.screen.blit(message, message_rect)
+
+        prompt = self.score_font.render(
+            "PRESS SPACE OR UP TO RESTART",
+            True,
+            OBJECT_COLOR,
+        )
+        prompt_rect = prompt.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 25))
+        self.screen.blit(prompt, prompt_rect)
 
 
 def main() -> None:
