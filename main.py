@@ -45,7 +45,7 @@ class Dinosaur:
         self.animation_counter = 0
         self.velocity_y = 0.0
         self.position_y = 0.0
-        self.duck_requested = False
+        self.down_key_held = False
 
         self.image = self.sprites["running"][self.animation_frame]
         self.rect = pygame.Rect(0, 0, 0, 0)
@@ -55,18 +55,22 @@ class Dinosaur:
 
     def _load_sprites(self, asset_dir: Path) -> dict[str, pygame.Surface | list[pygame.Surface]]:
         """Load every required dinosaur image from disk."""
+        running_sprites = [
+            self._load_image(asset_dir / "DinoRun1.png"),
+            self._load_image(asset_dir / "DinoRun2.png"),
+        ]
+        jump_sprite = self._load_image(asset_dir / "DinoJump.png")
+        start_sprite = self._load_image(asset_dir / "DinoStart.png")
+
         return {
-            "running": [
-                self._load_image(asset_dir / "DinoRun1.png"),
-                self._load_image(asset_dir / "DinoRun2.png"),
-            ],
-            "jumping": self._load_image(asset_dir / "DinoJump.png"),
+            "running": running_sprites,
+            "jumping": self._choose_jump_sprite(jump_sprite, start_sprite, running_sprites),
             "ducking": [
                 self._load_image(asset_dir / "DinoDuck1.png"),
                 self._load_image(asset_dir / "DinoDuck2.png"),
             ],
             "dead": self._load_image(asset_dir / "DinoDead.png"),
-            "start": self._load_image(asset_dir / "DinoStart.png"),
+            "start": start_sprite,
         }
 
     @staticmethod
@@ -79,15 +83,33 @@ class Dinosaur:
         except pygame.error as exc:
             raise RuntimeError(f"Unable to load sprite asset: {path}") from exc
 
+    @staticmethod
+    def _choose_jump_sprite(
+        jump_sprite: pygame.Surface,
+        start_sprite: pygame.Surface,
+        running_sprites: list[pygame.Surface],
+    ) -> pygame.Surface:
+        """Use an upright jump pose if the configured jump PNG is duck-sized."""
+        jump_bounds = jump_sprite.get_bounding_rect()
+        run_height = max(sprite.get_bounding_rect().height for sprite in running_sprites)
+
+        # Some asset packs accidentally ship DinoJump.png as a ducking frame.
+        # A jump pose should be roughly as tall as the running pose; otherwise
+        # the dinosaur appears to duck while airborne.
+        if jump_bounds.height < run_height * 0.8:
+            return start_sprite
+
+        return jump_sprite
+
     def handle_event(self, event: pygame.event.Event) -> None:
         """Translate key presses and releases into player intent."""
         if event.type == pygame.KEYDOWN:
             if event.key in (pygame.K_SPACE, pygame.K_UP):
                 self.jump()
             elif event.key == pygame.K_DOWN:
-                self.duck_requested = True
+                self.down_key_held = True
         elif event.type == pygame.KEYUP and event.key == pygame.K_DOWN:
-            self.duck_requested = False
+            self.down_key_held = False
 
     def jump(self) -> None:
         """Launch upward only when the dinosaur is touching the ground."""
@@ -107,7 +129,7 @@ class Dinosaur:
             self._apply_jump_physics()
         else:
             ground_state = (
-                DinosaurState.DUCKING if self.duck_requested else DinosaurState.RUNNING
+                DinosaurState.DUCKING if self.down_key_held else DinosaurState.RUNNING
             )
             self._set_state(ground_state)
 
@@ -129,7 +151,7 @@ class Dinosaur:
             self.position_y = float(self.rect.y)
             self.velocity_y = 0.0
             next_state = (
-                DinosaurState.DUCKING if self.duck_requested else DinosaurState.RUNNING
+                DinosaurState.DUCKING if self.down_key_held else DinosaurState.RUNNING
             )
             self._set_state(next_state)
 
