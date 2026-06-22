@@ -71,6 +71,7 @@ class Dinosaur:
         self.down_key_held = False
 
         self.image = self.sprites["running"][self.animation_frame]
+        self.mask = pygame.mask.from_surface(self.image)
         self.rect = pygame.Rect(0, 0, 0, 0)
         self.draw_rect = self.image.get_rect()
         self._place_sprite(self.START_X, self.ground_y)
@@ -215,6 +216,7 @@ class Dinosaur:
         running_sprites = self.sprites["running"]
         assert isinstance(running_sprites, list)
         self.image = running_sprites[self.animation_frame]
+        self.mask = pygame.mask.from_surface(self.image)
         self._place_sprite(self.START_X, self.ground_y)
         self.position_y = float(self.rect.y)
 
@@ -275,6 +277,7 @@ class Dinosaur:
             bottom = self.rect.bottom
 
         self.image = next_image
+        self.mask = pygame.mask.from_surface(self.image)
         self._place_sprite(left, bottom)
         self.position_y = float(self.rect.y)
 
@@ -356,21 +359,22 @@ class Cloud:
 class Cactus:
     """Asset-driven cactus obstacle with a tight visible-pixel hitbox."""
 
+    HITBOX_INSET_X = 10
+    HITBOX_INSET_Y = 6
+
     def __init__(self, image: pygame.Surface) -> None:
         self.image = image
+        self.mask = pygame.mask.from_surface(self.image)
         self.bounds = self._visible_sprite_bounds()
         self.x = float(WINDOW_WIDTH + random.randint(20, 80))
 
-        # The collision rectangle tracks only non-transparent pixels, while the
-        # draw rectangle preserves the original PNG canvas and its alpha padding.
-        self.rect = pygame.Rect(
-            round(self.x),
-            GROUND_Y - self.bounds.height,
-            self.bounds.width,
-            self.bounds.height,
-        )
+        # The visible rect tracks non-transparent pixels. The collision rect is
+        # then inset from that visible body so tiny edge pixels do not cause
+        # harsh early crashes.
+        self.visible_rect = pygame.Rect(0, 0, self.bounds.width, self.bounds.height)
+        self.rect = self.visible_rect.copy()
         self.draw_rect = self.image.get_rect()
-        self._sync_draw_rect_to_hitbox()
+        self._sync_rects()
 
     def _visible_sprite_bounds(self) -> pygame.Rect:
         """Return non-transparent sprite bounds for collision and grounding."""
@@ -382,17 +386,23 @@ class Cactus:
     def update(self, game_speed: float) -> None:
         """Move the cactus smoothly toward the dinosaur at obstacle speed."""
         self.x -= game_speed
-        self.rect.x = round(self.x)
-        self._sync_draw_rect_to_hitbox()
+        self._sync_rects()
 
-    def _sync_draw_rect_to_hitbox(self) -> None:
-        """Align the original texture canvas around the tight hitbox."""
-        self.draw_rect.left = self.rect.left - self.bounds.left
-        self.draw_rect.top = self.rect.top - self.bounds.top
+    def _sync_rects(self) -> None:
+        """Maintain visible pixels, tightened hitbox, and PNG canvas offsets."""
+        self.visible_rect.left = round(self.x)
+        self.visible_rect.bottom = GROUND_Y
+
+        self.rect = self.visible_rect.copy()
+        self.rect.inflate_ip(-self.HITBOX_INSET_X, -self.HITBOX_INSET_Y)
+        self.rect.bottom = GROUND_Y
+
+        self.draw_rect.left = self.visible_rect.left - self.bounds.left
+        self.draw_rect.top = self.visible_rect.top - self.bounds.top
 
     def is_off_screen(self) -> bool:
         """Return whether the visible cactus pixels have left the viewport."""
-        return self.rect.right < 0
+        return self.visible_rect.right < 0
 
     def draw(self, surface: pygame.Surface) -> None:
         """Blit the exact cactus PNG at its current world position."""
@@ -536,9 +546,15 @@ class Game:
         return random.choice(self.cactus_images[group_name])
 
     def _check_collisions(self) -> None:
-        """End the current run when the dinosaur hitbox touches a cactus."""
+        """End the current run when solid dinosaur and cactus pixels overlap."""
         for obstacle in self.obstacles:
-            if self.dinosaur.rect.colliderect(obstacle.rect):
+            # Masks are generated from the full PNG canvases, so their offset
+            # must use draw_rect positions rather than the debug hitbox rects.
+            offset = (
+                obstacle.draw_rect.x - self.dinosaur.draw_rect.x,
+                obstacle.draw_rect.y - self.dinosaur.draw_rect.y,
+            )
+            if self.dinosaur.mask.overlap(obstacle.mask, offset) is not None:
                 self._trigger_game_over()
                 return
 
@@ -579,7 +595,12 @@ class Game:
         self._draw_score()
         if self.game_over:
             self._draw_game_over()
+        # Draw a red border around the Dino's hitbox
+        pygame.draw.rect(self.screen, (255, 0, 0), self.dinosaur.rect, 2)
 
+        # Draw a blue border around every active cactus hitbox
+        for obstacle in self.obstacles:
+            pygame.draw.rect(self.screen, (0, 0, 255), obstacle.rect, 2)
         pygame.display.flip()
 
     def _draw_score(self) -> None:
