@@ -1,11 +1,9 @@
-"""Foundational Chrome Dino Run clone built with Pygame.
-
-This module intentionally focuses on the first production-ready slice of the
-game: window setup, a stable main loop, ground rendering, and responsive
-dinosaur jump physics.
-"""
+"""Foundational Chrome Dino Run clone built with Pygame sprites."""
 
 from __future__ import annotations
+
+from enum import Enum, auto
+from pathlib import Path
 
 import pygame
 
@@ -16,64 +14,208 @@ FPS = 60
 
 BACKGROUND_COLOR = (247, 247, 247)
 OBJECT_COLOR = (83, 83, 83)
-
 GROUND_Y = 300
+
+BASE_DIR = Path(__file__).resolve().parent
+ASSET_DIR = BASE_DIR / "assets"
+
+
+class DinosaurState(Enum):
+    """Current movement state for the dinosaur sprite."""
+
+    RUNNING = auto()
+    JUMPING = auto()
+    DUCKING = auto()
 
 
 class Dinosaur:
-    """Player-controlled dinosaur with simple vertical jump physics."""
+    """Player-controlled dinosaur with sprite animation and jump physics."""
 
-    WIDTH = 40
-    HEIGHT = 40
     START_X = 50
     JUMP_VELOCITY = 15
     GRAVITY = 0.8
+    ANIMATION_SWITCH_FRAMES = 10
 
-    def __init__(self, ground_y: int) -> None:
+    def __init__(self, ground_y: int, asset_dir: Path) -> None:
         self.ground_y = ground_y
-        self.rect = pygame.Rect(
-            self.START_X,
-            self.ground_y - self.HEIGHT,
-            self.WIDTH,
-            self.HEIGHT,
-        )
+        self.sprites = self._load_sprites(asset_dir)
+
+        self.state = DinosaurState.RUNNING
+        self.animation_frame = 0
+        self.animation_counter = 0
         self.velocity_y = 0.0
-        self.is_jumping = False
+        self.position_y = 0.0
+        self.duck_requested = False
+
+        self.image = self.sprites["running"][self.animation_frame]
+        self.rect = pygame.Rect(0, 0, 0, 0)
+        self.draw_rect = self.image.get_rect()
+        self._place_sprite(self.START_X, self.ground_y)
+        self.position_y = float(self.rect.y)
+
+    def _load_sprites(self, asset_dir: Path) -> dict[str, pygame.Surface | list[pygame.Surface]]:
+        """Load every required dinosaur image from disk."""
+        return {
+            "running": [
+                self._load_image(asset_dir / "DinoRun1.png"),
+                self._load_image(asset_dir / "DinoRun2.png"),
+            ],
+            "jumping": self._load_image(asset_dir / "DinoJump.png"),
+            "ducking": [
+                self._load_image(asset_dir / "DinoDuck1.png"),
+                self._load_image(asset_dir / "DinoDuck2.png"),
+            ],
+            "dead": self._load_image(asset_dir / "DinoDead.png"),
+            "start": self._load_image(asset_dir / "DinoStart.png"),
+        }
+
+    @staticmethod
+    def _load_image(path: Path) -> pygame.Surface:
+        """Load a sprite image and preserve PNG transparency."""
+        try:
+            return pygame.image.load(str(path)).convert_alpha()
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Missing required sprite asset: {path}") from exc
+        except pygame.error as exc:
+            raise RuntimeError(f"Unable to load sprite asset: {path}") from exc
 
     def handle_event(self, event: pygame.event.Event) -> None:
-        """Start a jump when requested, but only while grounded."""
-        if event.type != pygame.KEYDOWN:
-            return
-
-        if event.key in (pygame.K_SPACE, pygame.K_UP) and not self.is_jumping:
-            self.jump()
+        """Translate key presses and releases into player intent."""
+        if event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_SPACE, pygame.K_UP):
+                self.jump()
+            elif event.key == pygame.K_DOWN:
+                self.duck_requested = True
+        elif event.type == pygame.KEYUP and event.key == pygame.K_DOWN:
+            self.duck_requested = False
 
     def jump(self) -> None:
-        """Launch the dinosaur upward by setting its initial vertical speed."""
-        self.velocity_y = -self.JUMP_VELOCITY
-        self.is_jumping = True
-
-    def update(self) -> None:
-        """Advance the dinosaur physics by one frame."""
-        if not self.is_jumping:
+        """Launch upward only when the dinosaur is touching the ground."""
+        if not self.is_grounded():
             return
 
-        # Move first using the current velocity, then apply gravity so the
-        # upward motion eases out naturally and transitions into falling.
-        self.rect.y += int(self.velocity_y)
-        self.velocity_y += self.GRAVITY
+        self.velocity_y = -self.JUMP_VELOCITY
+        self._set_state(DinosaurState.JUMPING)
 
-        # Clamp the player back to the ground line to avoid sinking below it
-        # after gravity pulls the rectangle past the landing point.
-        ground_top = self.ground_y - self.HEIGHT
-        if self.rect.y >= ground_top:
-            self.rect.y = ground_top
+    def is_grounded(self) -> bool:
+        """Return whether the dinosaur's feet are aligned with the ground."""
+        return self.rect.bottom >= self.ground_y and self.state != DinosaurState.JUMPING
+
+    def update(self) -> None:
+        """Advance physics, state selection, and animation by one frame."""
+        if self.state == DinosaurState.JUMPING:
+            self._apply_jump_physics()
+        else:
+            ground_state = (
+                DinosaurState.DUCKING if self.duck_requested else DinosaurState.RUNNING
+            )
+            self._set_state(ground_state)
+
+        self._advance_animation()
+
+    def _apply_jump_physics(self) -> None:
+        """Move vertically using velocity, then accelerate downward."""
+        # Negative velocity moves the sprite upward because screen-space Y grows
+        # downward. Gravity increases velocity each frame until the dino falls.
+        self.position_y += self.velocity_y
+        self.velocity_y += self.GRAVITY
+        self.rect.y = round(self.position_y)
+        self._sync_draw_rect_to_hitbox()
+
+        # Clamp to the ground when landing so accumulated velocity cannot push
+        # the feet below the floor line.
+        if self.rect.bottom >= self.ground_y:
+            self.rect.bottom = self.ground_y
+            self.position_y = float(self.rect.y)
             self.velocity_y = 0.0
-            self.is_jumping = False
+            next_state = (
+                DinosaurState.DUCKING if self.duck_requested else DinosaurState.RUNNING
+            )
+            self._set_state(next_state)
+
+    def _set_state(self, new_state: DinosaurState) -> None:
+        """Switch state and reset animation when entering a new movement mode."""
+        if self.state == new_state:
+            return
+
+        self.state = new_state
+        self.animation_frame = 0
+        self.animation_counter = 0
+        self._sync_image_and_hitbox()
+
+    def _advance_animation(self) -> None:
+        """Toggle running and ducking sprites every fixed number of frames."""
+        if self.state == DinosaurState.JUMPING:
+            self._sync_image_and_hitbox()
+            return
+
+        self.animation_counter += 1
+        if self.animation_counter < self.ANIMATION_SWITCH_FRAMES:
+            return
+
+        self.animation_counter = 0
+        self.animation_frame = (self.animation_frame + 1) % 2
+        self._sync_image_and_hitbox()
+
+    def _sync_image_and_hitbox(self) -> None:
+        """Match the active sprite and collision rectangle to the current state."""
+        next_image = self._get_current_image()
+        if next_image is self.image:
+            self._sync_draw_rect_to_hitbox()
+            return
+
+        left = self.rect.left
+        bottom = self.ground_y if self.state != DinosaurState.JUMPING else self.rect.bottom
+
+        self.image = next_image
+        self._place_sprite(left, bottom)
+        self.position_y = float(self.rect.y)
+
+    def _place_sprite(self, hitbox_left: int, hitbox_bottom: int) -> None:
+        """Place visible sprite pixels at the requested hitbox coordinates."""
+        bounds = self._visible_sprite_bounds()
+
+        self.rect = pygame.Rect(
+            hitbox_left,
+            hitbox_bottom - bounds.height,
+            bounds.width,
+            bounds.height,
+        )
+        self._sync_draw_rect_to_hitbox()
+
+    def _sync_draw_rect_to_hitbox(self) -> None:
+        """Position the PNG canvas so its visible pixels wrap the hitbox."""
+        bounds = self._visible_sprite_bounds()
+        self.draw_rect = self.image.get_rect()
+        self.draw_rect.left = self.rect.left - bounds.left
+        self.draw_rect.top = self.rect.top - bounds.top
+
+    def _visible_sprite_bounds(self) -> pygame.Rect:
+        """Return the non-transparent sprite bounds used for collision sizing."""
+        bounds = self.image.get_bounding_rect()
+        if bounds.width == 0 or bounds.height == 0:
+            return self.image.get_rect()
+        return bounds
+
+    def _get_current_image(self) -> pygame.Surface:
+        """Choose the sprite that should be visible for the current state."""
+        if self.state == DinosaurState.RUNNING:
+            running_sprites = self.sprites["running"]
+            assert isinstance(running_sprites, list)
+            return running_sprites[self.animation_frame]
+
+        if self.state == DinosaurState.DUCKING:
+            ducking_sprites = self.sprites["ducking"]
+            assert isinstance(ducking_sprites, list)
+            return ducking_sprites[self.animation_frame]
+
+        jumping_sprite = self.sprites["jumping"]
+        assert isinstance(jumping_sprite, pygame.Surface)
+        return jumping_sprite
 
     def draw(self, surface: pygame.Surface) -> None:
-        """Render the placeholder dinosaur rectangle."""
-        pygame.draw.rect(surface, OBJECT_COLOR, self.rect)
+        """Draw the current dinosaur sprite."""
+        surface.blit(self.image, self.draw_rect)
 
 
 class Game:
@@ -84,11 +226,11 @@ class Game:
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption("Chrome Dino Run")
         self.clock = pygame.time.Clock()
-        self.dinosaur = Dinosaur(GROUND_Y)
+        self.dinosaur = Dinosaur(GROUND_Y, ASSET_DIR)
         self.running = True
 
     def run(self) -> None:
-        """Execute the locked 60 FPS game loop."""
+        """Execute the main loop at a locked 60 FPS."""
         while self.running:
             self.handle_events()
             self.update()
@@ -98,7 +240,7 @@ class Game:
         pygame.quit()
 
     def handle_events(self) -> None:
-        """Process window events and route player input."""
+        """Process OS events and route gameplay input."""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
@@ -106,11 +248,11 @@ class Game:
                 self.dinosaur.handle_event(event)
 
     def update(self) -> None:
-        """Update every active game object in sequence."""
+        """Update game objects in a deterministic order."""
         self.dinosaur.update()
 
     def draw(self) -> None:
-        """Draw the full frame using the classic Chrome Dino palette."""
+        """Render a complete frame."""
         self.screen.fill(BACKGROUND_COLOR)
         pygame.draw.line(
             self.screen,
@@ -124,7 +266,7 @@ class Game:
 
 
 def main() -> None:
-    """Create and run the game."""
+    """Create and run the game application."""
     game = Game()
     game.run()
 
