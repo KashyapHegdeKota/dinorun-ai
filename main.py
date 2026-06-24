@@ -35,6 +35,7 @@ OBSTACLE_MAX_GAP_PIXELS = 720
 OBSTACLE_MIN_SAFE_FRAMES = 50
 OBSTACLE_MAX_SAFE_FRAMES = 85
 FIRST_OBSTACLE_DELAY_FRAMES = 60
+POPULATION_SIZE = 100
 
 CACTUS_ASSET_FILES = {
     "large": ["LargeCactus1.png", "LargeCactus2.png", "LargeCactus3.png"],
@@ -69,6 +70,9 @@ class Dinosaur:
         self.velocity_y = 0.0
         self.position_y = 0.0
         self.down_key_held = False
+        self.is_alive = True
+        self.fitness_score = 0.0
+        self.sensor_inputs = (float("inf"), 0, 0, INITIAL_GAME_SPEED)
 
         self.image = self.sprites["running"][self.animation_frame]
         self.mask = pygame.mask.from_surface(self.image)
@@ -200,8 +204,10 @@ class Dinosaur:
 
         self._advance_animation()
 
-    def die(self) -> None:
+    def die(self, fitness_score: float) -> None:
         """Switch to the dead sprite and stop all player motion."""
+        self.is_alive = False
+        self.fitness_score = fitness_score
         self.velocity_y = 0.0
         self.down_key_held = False
         self._set_state(DinosaurState.DEAD)
@@ -213,6 +219,9 @@ class Dinosaur:
         self.animation_counter = 0
         self.velocity_y = 0.0
         self.down_key_held = False
+        self.is_alive = True
+        self.fitness_score = 0.0
+        self.sensor_inputs = (float("inf"), 0, 0, INITIAL_GAME_SPEED)
         running_sprites = self.sprites["running"]
         assert isinstance(running_sprites, list)
         self.image = running_sprites[self.animation_frame]
@@ -421,12 +430,16 @@ class Game:
         self.game_over_font = pygame.font.SysFont("consolas", 36, bold=True)
         self.cloud_image = self._load_image(ASSET_DIR / "Cloud.png")
         self.cactus_images = self._load_cactus_images(ASSET_DIR)
-        self.dinosaur = Dinosaur(GROUND_Y, ASSET_DIR)
+        self.dinosaurs = [
+            Dinosaur(GROUND_Y, ASSET_DIR) for _ in range(POPULATION_SIZE)
+        ]
         self.running = True
         self.game_over = False
         self.game_speed = INITIAL_GAME_SPEED
         self.score = 0.0
         self.high_score = 0
+        self.generation = 1
+        self.sensor_snapshots: list[tuple[Dinosaur, tuple[float, int, int, float]]] = []
         self.clouds: list[Cloud] = []
         self.obstacles: list[Cactus] = []
         self.cloud_spawn_timer = 20
@@ -472,21 +485,56 @@ class Game:
                     pygame.K_SPACE,
                     pygame.K_UP,
                 ):
-                    self.reset_game()
+                    self.reset_generation()
             else:
-                self.dinosaur.handle_event(event)
+                for dinosaur in self.dinosaurs:
+                    if dinosaur.is_alive:
+                        dinosaur.handle_event(event)
 
     def update(self) -> None:
-        """Update game objects in a deterministic order."""
-        if self.game_over:
+        """Update the active swarm, environment, sensors, and collisions."""
+        alive_dinosaurs = [dinosaur for dinosaur in self.dinosaurs if dinosaur.is_alive]
+        print(f"Active Swarm Population: {len(alive_dinosaurs)}")
+        if not alive_dinosaurs:
+            self.reset_generation()
             return
 
         pressed_keys = pygame.key.get_pressed()
-        self.dinosaur.update(pressed_keys)
+        for dinosaur in alive_dinosaurs:
+            dinosaur.update(pressed_keys)
+
         self._update_score_and_speed()
         self._update_clouds()
         self._update_obstacles()
+
+        closest_obstacle = self.get_closest_obstacle()
+        self.sensor_snapshots = []
+        for dinosaur in alive_dinosaurs:
+            if closest_obstacle is None:
+                dinosaur.sensor_inputs = (float("inf"), 0, 0, self.game_speed)
+            else:
+                dinosaur.sensor_inputs = (
+                    closest_obstacle.rect.left - dinosaur.rect.right,
+                    closest_obstacle.rect.width,
+                    closest_obstacle.rect.height,
+                    self.game_speed,
+                )
+            self.sensor_snapshots.append((dinosaur, dinosaur.sensor_inputs))
+
         self._check_collisions()
+
+        if not any(dinosaur.is_alive for dinosaur in self.dinosaurs):
+            self.reset_generation()
+
+    def get_closest_obstacle(self) -> Cactus | None:
+        """Return the nearest obstacle still in front of the dinosaur swarm."""
+        forward_obstacles = [
+            obstacle for obstacle in self.obstacles if obstacle.rect.left > Dinosaur.START_X
+        ]
+        if not forward_obstacles:
+            return None
+
+        return min(forward_obstacles, key=lambda obstacle: obstacle.rect.left)
 
     def _update_score_and_speed(self) -> None:
         """Increase score and gradually accelerate the game each active frame."""
@@ -546,26 +594,34 @@ class Game:
         return random.choice(self.cactus_images[group_name])
 
     def _check_collisions(self) -> None:
-        """End the current run when solid dinosaur and cactus pixels overlap."""
+        """Mark individual dinosaurs dead when solid pixels overlap a cactus."""
+        alive_dinosaurs = [
+            dinosaur for dinosaur in self.dinosaurs if dinosaur.is_alive
+        ]
         for obstacle in self.obstacles:
-            # Masks are generated from the full PNG canvases, so their offset
-            # must use draw_rect positions rather than the debug hitbox rects.
-            offset = (
-                obstacle.draw_rect.x - self.dinosaur.draw_rect.x,
-                obstacle.draw_rect.y - self.dinosaur.draw_rect.y,
-            )
-            if self.dinosaur.mask.overlap(obstacle.mask, offset) is not None:
-                self._trigger_game_over()
-                return
+            for dinosaur in alive_dinosaurs:
+                if not dinosaur.is_alive:
+                    continue
+
+                # Masks are generated from the full PNG canvases, so their offset
+                # must use draw_rect positions rather than the debug hitbox rects.
+                offset = (
+                    obstacle.draw_rect.x - dinosaur.draw_rect.x,
+                    obstacle.draw_rect.y - dinosaur.draw_rect.y,
+                )
+                if dinosaur.mask.overlap(obstacle.mask, offset) is not None:
+                    dinosaur.die(self.score)
 
     def _trigger_game_over(self) -> None:
         """Freeze gameplay and put the dinosaur into its dead sprite state."""
         self.game_over = True
         self.high_score = max(self.high_score, int(self.score))
-        self.dinosaur.die()
+        for dinosaur in self.dinosaurs:
+            if dinosaur.is_alive:
+                dinosaur.die(self.score)
 
-    def reset_game(self) -> None:
-        """Start a fresh run while preserving the session high score."""
+    def reset_generation(self) -> None:
+        """Start a fresh simulation generation with 100 new dinosaurs."""
         self.game_over = False
         self.game_speed = INITIAL_GAME_SPEED
         self.score = 0.0
@@ -573,7 +629,15 @@ class Game:
         self.obstacles.clear()
         self.cloud_spawn_timer = 20
         self.obstacle_spawn_timer = FIRST_OBSTACLE_DELAY_FRAMES
-        self.dinosaur.reset()
+        self.sensor_snapshots.clear()
+        self.generation += 1
+        self.dinosaurs = [
+            Dinosaur(GROUND_Y, ASSET_DIR) for _ in range(POPULATION_SIZE)
+        ]
+
+    def reset_game(self) -> None:
+        """Compatibility wrapper for manual resets."""
+        self.reset_generation()
 
     def draw(self) -> None:
         """Render a complete frame."""
@@ -591,12 +655,18 @@ class Game:
         for obstacle in self.obstacles:
             obstacle.draw(self.screen)
 
-        self.dinosaur.draw(self.screen)
+        for dinosaur in self.dinosaurs:
+            if dinosaur.is_alive:
+                dinosaur.draw(self.screen)
+
         self._draw_score()
         if self.game_over:
             self._draw_game_over()
-        # Draw a red border around the Dino's hitbox
-        pygame.draw.rect(self.screen, (255, 0, 0), self.dinosaur.rect, 2)
+
+        # Draw a red border around every alive Dino's hitbox.
+        for dinosaur in self.dinosaurs:
+            if dinosaur.is_alive:
+                pygame.draw.rect(self.screen, (255, 0, 0), dinosaur.rect, 2)
 
         # Draw a blue border around every active cactus hitbox
         for obstacle in self.obstacles:
